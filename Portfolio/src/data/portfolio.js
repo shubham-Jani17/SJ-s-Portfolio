@@ -265,7 +265,6 @@ export const experience = [
 
 export const sections = {
   blogs: true,
-  testimonials: false,
 };
 
 export const blogs = [
@@ -277,6 +276,6 @@ export const blogs = [
   },
 ];
 
-export const testimonials = [];
+
 
 
