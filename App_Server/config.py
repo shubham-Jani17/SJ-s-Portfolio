@@ -13,14 +13,14 @@ class Settings(BaseSettings):
     # MySQL Database connection URL
     MYSQL_URL: str = os.getenv(
         "MYSQL_URL",
-        "mysql+pymysql://root:password@localhost:3306/portfolio_db"
+        "your_sql_db_url_here"
     )
     
     # Static JWT/auth token for temporary simplified validation
     JWT_SECRET: str = os.getenv("JWT_SECRET", "your_super_secret_jwt_key_here")
     
     # Admin password
-    ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "")
+    ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "your_dbpassword_here")
     
     # Uvicorn Port (Default to 3001 for proxy alignment with frontend)
     PORT: int = int(os.getenv("PORT", 3001))
