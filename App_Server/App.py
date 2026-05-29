@@ -8,7 +8,7 @@ from typing import Optional, List
 
 from fastapi import FastAPI, Depends, HTTPException, Request, status, Body, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
@@ -16,19 +16,46 @@ from config import settings
 from database import engine, Base, get_db
 import models
 
-STATIC_ADMIN_TOKEN = "settings.STATIC_ADMIN_TOKEN"
 MAX_VISITOR_IDS = 50000
 
 APP_SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = os.path.dirname(APP_SERVER_DIR)  
 PUBLIC_DIR = os.path.join(BASE_DIR, "Portfolio", "public")
 
+import hashlib
+from cryptography.fernet import Fernet
+
+# Derive a 32-byte URL-safe base64 key from SESSION_SECRET
+key_bytes = hashlib.sha256(settings.SESSION_SECRET.encode()).digest()
+fernet_key = base64.urlsafe_b64encode(key_bytes)
+cipher_suite = Fernet(fernet_key)
+
+def encrypt_password(password: str) -> str:
+    if not password:
+        return ""
+    return cipher_suite.encrypt(password.encode('utf-8')).decode('utf-8')
+
+def decrypt_password(encrypted_password: str) -> str:
+    if not encrypted_password:
+        return ""
+    try:
+        return cipher_suite.decrypt(encrypted_password.encode('utf-8')).decode('utf-8')
+    except Exception:
+        # If decryption fails (e.g. legacy plain text), return as is for migration
+        return encrypted_password
+
+
 class AdminLogin(BaseModel):
+    email: EmailStr
     password: str
 
 class PasswordUpdate(BaseModel):
     currentPassword: str
     newPassword: str
+
+class EmailUpdate(BaseModel):
+    currentPassword: str
+    newEmail: EmailStr
 
 class MessageCreate(BaseModel):
     name: str
@@ -44,14 +71,23 @@ app = FastAPI(title="Portfolio API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
-    allow_credentials=True,
+    allow_origins=[
+        "http://localhost:3001",
+        "http://localhost:5173",
+        "http://127.0.0.1:3001",
+        "http://127.0.0.1:5173",
+        "http://localhost:5000",
+        "http://127.0.0.1:5000",
+        "http://localhost:3002",
+        "http://127.0.0.1:3002",
+    ],
+    allow_credentials=True,   # Required for cookies to be sent cross-origin
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-security = HTTPBearer()
+security = None  # HTTPBearer removed — now using HttpOnly cookies
 
 login_attempts = {}
 
@@ -61,13 +97,13 @@ def get_client_ip(request: Request) -> str:
         return x_forwarded_for.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
-def check_admin(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
-    if token != STATIC_ADMIN_TOKEN:
+def check_admin(request: Request):
+    """Validate the HttpOnly session cookie on every protected route."""
+    session = request.cookies.get("admin_session")
+    if not session or session != settings.SESSION_SECRET:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token",
-            headers={"WWW-Authenticate": "Bearer"},
+            detail="Not authenticated. Please log in.",
         )
     return "admin"
 
@@ -95,6 +131,17 @@ def decode_base64_file(data_url: str, max_size_mb: int, allowed_types_regex: str
 def startup_event():
     # 1. Create tables automatically if they do not exist
     try:
+        # Check and apply database table modifications for existing installations
+        from sqlalchemy import inspect, text
+        inspector = inspect(engine)
+        if inspector.has_table("admin"):
+            columns = [c['name'] for c in inspector.get_columns('admin')]
+            if 'email' not in columns:
+                print(">>> Altering table 'admin' to add 'email' column.")
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE admin ADD COLUMN email VARCHAR(100) UNIQUE DEFAULT NULL"))
+                    conn.commit()
+        
         Base.metadata.create_all(bind=engine)
         print(">>> Database tables verified/created successfully.")
     except Exception as e:
@@ -108,10 +155,22 @@ def startup_event():
         db = SessionLocal()
         admin = db.query(models.Admin).filter(models.Admin.username == "admin").first()
         if not admin:
-            db_admin = models.Admin(username="admin", password=settings.ADMIN_PASSWORD)
+            db_admin = models.Admin(username="admin", email=settings.ADMIN_EMAIL, password=encrypt_password(settings.ADMIN_PASSWORD))
             db.add(db_admin)
             db.commit()
-            print(">>> Default admin account setup successfully.")
+            print(">>> Default admin account setup successfully with encrypted password.")
+        else:
+            # Migrate to encrypted format if not already encrypted (Fernet strings start with gAAAA)
+            if not admin.password.startswith("gAAAA"):
+                admin.password = encrypt_password(admin.password)
+                db.commit()
+                print(">>> Admin password migrated to encrypted format.")
+            
+            if not admin.email:
+                admin.email = settings.ADMIN_EMAIL
+                db.commit()
+                print(">>> Default admin account updated with email.")
+
 
         # 3. Migrate legacy skills from site_settings.skills JSON column to new skills table if empty
         skills_count = db.query(models.Skill).count()
@@ -182,12 +241,12 @@ def home():
 # --- AUTH ---
 @app.post("/api/auth/login")
 def login(request: Request, admin_login: AdminLogin, db: Session = Depends(get_db)):
-    client_ip = get_client_ip(request)
+    device_id = request.headers.get("x-device-id") or get_client_ip(request)
     now = datetime.utcnow()
 
-    # Check if this IP is currently locked out
-    if client_ip in login_attempts:
-        record = login_attempts[client_ip]
+    # Check if this device is currently locked out
+    if device_id in login_attempts:
+        record = login_attempts[device_id]
         if record["blocked_until"] and now < record["blocked_until"]:
             remaining_time = record["blocked_until"] - now
             remaining_minutes = int(remaining_time.total_seconds() / 60)
@@ -197,20 +256,18 @@ def login(request: Request, admin_login: AdminLogin, db: Session = Depends(get_d
                 detail=f"Too many failed login attempts. Locked out. Try again in {remaining_minutes}m {remaining_seconds}s."
             )
 
-    admin = db.query(models.Admin).filter(models.Admin.username == "admin").first()
-    if not admin:
-        raise HTTPException(status_code=400, detail="Admin account not initialized.")
+    admin = db.query(models.Admin).filter(models.Admin.email == admin_login.email).first()
     
-    if admin_login.password != admin.password:
-        if client_ip not in login_attempts:
-            login_attempts[client_ip] = {"attempts": 0, "blocked_until": None}
+    if not admin or admin_login.password != decrypt_password(admin.password):
+        if device_id not in login_attempts:
+            login_attempts[device_id] = {"attempts": 0, "blocked_until": None}
             
-        login_attempts[client_ip]["attempts"] += 1
-        attempts_left = 5 - login_attempts[client_ip]["attempts"]
+        login_attempts[device_id]["attempts"] += 1
+        attempts_left = 5 - login_attempts[device_id]["attempts"]
         
-        if login_attempts[client_ip]["attempts"] >= 5:
-            login_attempts[client_ip]["blocked_until"] = now + timedelta(hours=2)
-            login_attempts[client_ip]["attempts"] = 0
+        if login_attempts[device_id]["attempts"] >= 5:
+            login_attempts[device_id]["blocked_until"] = now + timedelta(hours=2)
+            login_attempts[device_id]["attempts"] = 0
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Too many failed login attempts. Locked out for 2 hours."
@@ -218,26 +275,52 @@ def login(request: Request, admin_login: AdminLogin, db: Session = Depends(get_d
         else:
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid password. {attempts_left} attempts remaining."
+                detail=f"Invalid email or password. {attempts_left} attempts remaining."
             )
             
     # Reset tracking upon successful login
-    if client_ip in login_attempts:
-        login_attempts[client_ip] = {"attempts": 0, "blocked_until": None}
-        
-    return {"token": STATIC_ADMIN_TOKEN}
+    if device_id in login_attempts:
+        login_attempts[device_id] = {"attempts": 0, "blocked_until": None}
+
+    # Set HttpOnly session cookie (JS cannot read this)
+    response = JSONResponse({"ok": True})
+    response.set_cookie(
+        key="admin_session",
+        value=settings.SESSION_SECRET,
+        httponly=True,        # Invisible to JavaScript — XSS safe
+        samesite="strict",    # Blocks cross-site requests — CSRF safe
+        secure=False,         # Set True when deploying on HTTPS
+        max_age=60 * 60 * 8,  # 8 hours
+        path="/",
+    )
+    return response
+
+@app.post("/api/auth/logout")
+def logout(response: Response):
+    """Clear the session cookie — effectively logs the admin out."""
+    response.delete_cookie(key="admin_session", path="/")
+    return {"ok": True}
+
+@app.get("/api/auth/me")
+def me(request: Request, db: Session = Depends(get_db)):
+    """Returns 200 if the session cookie is valid, 401 otherwise."""
+    check_admin(request)
+    admin = db.query(models.Admin).filter(models.Admin.username == "admin").first()
+    email = admin.email if admin else ""
+    return {"ok": True, "email": email}
 
 @app.put("/api/auth/password")
 def update_password(
-    pwd_update: PasswordUpdate, 
-    db: Session = Depends(get_db),
-    admin: str = Depends(check_admin)
+    request: Request,
+    pwd_update: PasswordUpdate,
+    db: Session = Depends(get_db)
 ):
+    check_admin(request)
     admin_record = db.query(models.Admin).filter(models.Admin.username == "admin").first()
     if not admin_record:
         raise HTTPException(status_code=400, detail="Admin account not found")
 
-    if pwd_update.currentPassword != admin_record.password:
+    if pwd_update.currentPassword != decrypt_password(admin_record.password):
         raise HTTPException(status_code=400, detail="Incorrect current password")
         
     # Validation checks for strength
@@ -250,7 +333,25 @@ def update_password(
             detail="Password must be 8+ chars and contain uppercase, lowercase, number, and special character."
         )
         
-    admin_record.password = new_pwd
+    admin_record.password = encrypt_password(new_pwd)
+    db.commit()
+    return {"ok": True}
+
+@app.put("/api/auth/email")
+def update_email(
+    request: Request,
+    email_update: EmailUpdate,
+    db: Session = Depends(get_db)
+):
+    check_admin(request)
+    admin_record = db.query(models.Admin).filter(models.Admin.username == "admin").first()
+    if not admin_record:
+        raise HTTPException(status_code=400, detail="Admin account not found")
+
+    if email_update.currentPassword != decrypt_password(admin_record.password):
+        raise HTTPException(status_code=400, detail="Incorrect password")
+
+    admin_record.email = email_update.newEmail.strip()
     db.commit()
     return {"ok": True}
 
@@ -361,7 +462,8 @@ def get_portfolio(response: Response, includeArchived: str = "false", db: Sessio
     }
 
 @app.put("/api/portfolio")
-async def save_portfolio(request: Request, db: Session = Depends(get_db), admin: str = Depends(check_admin)):
+async def save_portfolio(request: Request, db: Session = Depends(get_db)):
+    check_admin(request)
     body = await request.json()
     if not body or not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Invalid payload")
@@ -443,10 +545,11 @@ async def save_portfolio(request: Request, db: Session = Depends(get_db), admin:
 # --- UPLOADS ---
 @app.post("/api/upload/hero-portrait")
 def upload_hero_portrait(
+    request: Request,
     payload: dict = Body(...),
-    db: Session = Depends(get_db),
-    admin: str = Depends(check_admin)
+    db: Session = Depends(get_db)
 ):
+    check_admin(request)
     data_url = payload.get("dataUrl")
     if not data_url:
         raise HTTPException(status_code=400, detail="dataUrl is required")
@@ -478,9 +581,10 @@ def upload_hero_portrait(
 
 @app.post("/api/upload/project-image")
 def upload_project_image(
-    payload: dict = Body(...),
-    admin: str = Depends(check_admin)
+    request: Request,
+    payload: dict = Body(...)
 ):
+    check_admin(request)
     data_url = payload.get("dataUrl")
     project_id = payload.get("projectId", "project")
     if not data_url:
@@ -500,10 +604,11 @@ def upload_project_image(
 
 @app.post("/api/upload/resume")
 def upload_resume(
+    request: Request,
     payload: dict = Body(...),
-    db: Session = Depends(get_db),
-    admin: str = Depends(check_admin)
+    db: Session = Depends(get_db)
 ):
+    check_admin(request)
     data_url = payload.get("dataUrl")
     filename = payload.get("filename", "Shubham Jani Resume.pdf")
     if not data_url:
@@ -542,7 +647,8 @@ def submit_contact(msg_create: MessageCreate, db: Session = Depends(get_db)):
     return {"ok": True, "id": new_msg.id}
 
 @app.get("/api/messages")
-def get_messages(archived: str = "false", db: Session = Depends(get_db), admin: str = Depends(check_admin)):
+def get_messages(request: Request, archived: str = "false", db: Session = Depends(get_db)):
+    check_admin(request)
     show_archived = archived == "true"
     messages = db.query(models.Message).filter(models.Message.archived == show_archived).order_by(models.Message.created_at.desc()).all()
     return [
@@ -559,11 +665,12 @@ def get_messages(archived: str = "false", db: Session = Depends(get_db), admin: 
 
 @app.patch("/api/messages/{msg_id}")
 def update_message(
+    request: Request,
     msg_id: str,
     msg_update: MessageUpdate,
-    db: Session = Depends(get_db),
-    admin: str = Depends(check_admin)
+    db: Session = Depends(get_db)
 ):
+    check_admin(request)
     msg = db.query(models.Message).filter(models.Message.id == msg_id).first()
     if not msg:
         raise HTTPException(status_code=404, detail="Message not found")
@@ -583,7 +690,8 @@ def update_message(
     }
 
 @app.delete("/api/messages/{msg_id}")
-def delete_message(msg_id: str, db: Session = Depends(get_db), admin: str = Depends(check_admin)):
+def delete_message(request: Request, msg_id: str, db: Session = Depends(get_db)):
+    check_admin(request)
     msg = db.query(models.Message).filter(models.Message.id == msg_id).first()
     if not msg:
         raise HTTPException(status_code=404, detail="Message not found")
@@ -625,7 +733,8 @@ def record_view(payload: dict = Body(...), db: Session = Depends(get_db)):
     }
 
 @app.get("/api/analytics")
-def get_analytics(db: Session = Depends(get_db), admin: str = Depends(check_admin)):
+def get_analytics(request: Request, db: Session = Depends(get_db)):
+    check_admin(request)
     analytics = db.query(models.Analytics).filter(models.Analytics.id == 1).first()
     if not analytics:
         return {"totalViews": 0, "uniqueVisitors": 0, "lastViewAt": None}
